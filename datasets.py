@@ -6,12 +6,36 @@
 # LICENSE file in the root directory of this source tree.
 
 
+import importlib.util
 import os
+from pathlib import Path
 from torchvision import datasets, transforms
 
 from timm.data.constants import \
     IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 from timm.data import create_transform
+
+
+_DISFA_MODULE = None
+
+
+def _get_disfa_module():
+    global _DISFA_MODULE
+    if _DISFA_MODULE is None:
+        module_path = Path(__file__).resolve().parent / 'dataset' / 'DISFA' / 'disfa_pytorch_dataset.py'
+        spec = importlib.util.spec_from_file_location('disfa_pytorch_dataset', module_path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f'Unable to load DISFA dataset module from {module_path}')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _DISFA_MODULE = module
+    return _DISFA_MODULE
+
+
+def _parse_disfa_selected_aus(selected_aus):
+    if not selected_aus:
+        return None
+    return tuple(int(au.strip()) for au in selected_aus.split(',') if au.strip())
 
 def build_dataset(is_train, args):
     transform = build_transform(is_train, args)
@@ -40,6 +64,22 @@ def build_dataset(is_train, args):
         dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = args.nb_classes
         assert len(dataset.class_to_idx) == nb_classes
+    elif args.data_set == 'DISFA':
+        disfa_module = _get_disfa_module()
+
+        manifest_path = args.disfa_manifest_path or os.path.join(
+            args.data_path, 'prepared', 'disfa_aligned_manifest.csv')
+        split = 'train' if is_train else args.disfa_eval_split
+        selected_aus = _parse_disfa_selected_aus(args.disfa_selected_aus) or disfa_module.AUS
+        dataset = disfa_module.DISFAAlignedDataset(
+            manifest_path=manifest_path,
+            dataset_root=args.data_path,
+            split=split,
+            target_mode=args.disfa_target_mode,
+            selected_aus=selected_aus,
+            image_transform=transform,
+        )
+        nb_classes = len(selected_aus)
     else:
         raise NotImplementedError()
     print("Number of the class = %d" % nb_classes)
@@ -48,6 +88,20 @@ def build_dataset(is_train, args):
 
 
 def build_transform(is_train, args):
+    if args.data_set == 'DISFA':
+        # DISFA images are already aligned facial crops, so keep resizing simple.
+        t = [transforms.Resize((args.input_size, args.input_size), interpolation=transforms.InterpolationMode.BICUBIC)]
+        if is_train:
+            t.extend([
+                transforms.RandomHorizontalFlip(p=0.5),
+                transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.10),
+            ])
+        t.extend([
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_DEFAULT_MEAN, std=IMAGENET_DEFAULT_STD),
+        ])
+        return transforms.Compose(t)
+
     resize_im = args.input_size > 32
     imagenet_default_mean_and_std = args.imagenet_default_mean_and_std
     mean = IMAGENET_INCEPTION_MEAN if not imagenet_default_mean_and_std else IMAGENET_DEFAULT_MEAN

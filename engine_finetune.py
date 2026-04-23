@@ -17,6 +17,12 @@ from timm.utils import accuracy, ModelEma
 import utils
 from utils import adjust_learning_rate
 
+
+def multilabel_accuracy(output, targets, threshold=0.5):
+    pred = torch.sigmoid(output) >= threshold
+    truth = targets >= 0.5
+    return pred.eq(truth).float().mean()
+
 def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, loss_scaler, max_norm: float = 0,
@@ -30,6 +36,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
     update_freq = args.update_freq
     use_amp = args.use_amp
+    multilabel = getattr(args, 'multilabel', False)
+    threshold = getattr(args, 'disfa_threshold', 0.5)
     optimizer.zero_grad()
 
     for data_iter_step, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
@@ -39,6 +47,8 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
         samples = samples.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
+        if multilabel:
+            targets = targets.float()
 
         if mixup_fn is not None:
             samples, targets = mixup_fn(samples, targets)
@@ -79,13 +89,19 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         
         torch.cuda.synchronize()
 
-        if mixup_fn is None:
+        if multilabel:
+            au_acc = multilabel_accuracy(output, targets, threshold=threshold)
+            class_acc = None
+        elif mixup_fn is None:
             class_acc = (output.max(-1)[-1] == targets).float().mean()
         else:
             class_acc = None
 
         metric_logger.update(loss=loss_value)
-        metric_logger.update(class_acc=class_acc)
+        if multilabel:
+            metric_logger.update(au_acc=au_acc)
+        else:
+            metric_logger.update(class_acc=class_acc)
         min_lr = 10.
         max_lr = 0.
         for group in optimizer.param_groups:
@@ -103,7 +119,10 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
             metric_logger.update(grad_norm=grad_norm)
         if log_writer is not None:
             log_writer.update(loss=loss_value, head="loss")
-            log_writer.update(class_acc=class_acc, head="loss")
+            if multilabel:
+                log_writer.update(au_acc=au_acc, head="loss")
+            else:
+                log_writer.update(class_acc=class_acc, head="loss")
             log_writer.update(lr=max_lr, head="opt")
             log_writer.update(min_lr=min_lr, head="opt")
             log_writer.update(weight_decay=weight_decay_value, head="opt")
@@ -117,11 +136,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, use_amp=False):
-    criterion = torch.nn.CrossEntropyLoss()
+def evaluate(data_loader, model, device, use_amp=False, criterion=None, multilabel=False, threshold=0.5):
+    if criterion is None:
+        criterion = torch.nn.BCEWithLogitsLoss() if multilabel else torch.nn.CrossEntropyLoss()
 
     metric_logger = utils.MetricLogger(delimiter="  ")
     header = 'Test:'
+
+    if multilabel:
+        true_positives = None
+        false_positives = None
+        false_negatives = None
 
     # switch to evaluation mode
     model.eval()
@@ -132,6 +157,8 @@ def evaluate(data_loader, model, device, use_amp=False):
 
         images = images.to(device, non_blocking=True)
         target = target.to(device, non_blocking=True)
+        if multilabel:
+            target = target.float()
 
         # compute output
         if use_amp:
@@ -147,15 +174,41 @@ def evaluate(data_loader, model, device, use_amp=False):
             loss = criterion(output, target)
 
         torch.cuda.synchronize()
-        
-        acc1, acc5 = accuracy(output, target, topk=(1, 5))
 
         batch_size = images.shape[0]
         metric_logger.update(loss=loss.item())
-        metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
-        metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
+        if multilabel:
+            pred = torch.sigmoid(output) >= threshold
+            truth = target >= 0.5
+            batch_au_acc = pred.eq(truth).float().mean().item() * 100.0
+            metric_logger.meters['au_acc'].update(batch_au_acc, n=batch_size)
+
+            batch_tp = (pred & truth).sum(dim=0).to(dtype=torch.float32).cpu()
+            batch_fp = (pred & ~truth).sum(dim=0).to(dtype=torch.float32).cpu()
+            batch_fn = ((~pred) & truth).sum(dim=0).to(dtype=torch.float32).cpu()
+            if true_positives is None:
+                true_positives = batch_tp
+                false_positives = batch_fp
+                false_negatives = batch_fn
+            else:
+                true_positives += batch_tp
+                false_positives += batch_fp
+                false_negatives += batch_fn
+        else:
+            acc1, acc5 = accuracy(output, target, topk=(1, 5))
+            metric_logger.meters['acc1'].update(acc1.item(), n=batch_size)
+            metric_logger.meters['acc5'].update(acc5.item(), n=batch_size)
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+    if multilabel:
+        denom = (2 * true_positives + false_positives + false_negatives).clamp_min(1.0)
+        au_f1 = ((2 * true_positives) / denom).mean().item() * 100.0
+        print('* AU-Acc {au_acc.global_avg:.3f} AU-F1 {au_f1:.3f} loss {losses.global_avg:.3f}'
+              .format(au_acc=metric_logger.au_acc, au_f1=au_f1, losses=metric_logger.loss))
+        stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+        stats['au_f1'] = au_f1
+        return stats
+
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
           .format(top1=metric_logger.acc1, top5=metric_logger.acc5, losses=metric_logger.loss))
 

@@ -4,3 +4,6 @@
 /.smoke_runs
 /.vscode
 /models/__pycache__
+/pretrained_weights
+finetune_scripts.txt
+/runs
