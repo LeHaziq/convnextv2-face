@@ -161,6 +161,8 @@ def get_args_parser():
                         help='Use DISFA per-AU positive class weighting for BCE loss')
     parser.add_argument('--disfa_threshold', type=float, default=0.5,
                         help='Sigmoid threshold for DISFA AU metrics')
+    parser.add_argument('--disfa_log_micro_f1', type=str2bool, default=False,
+                        help='Print and log DISFA micro-F1 during per-epoch evaluation')
     parser.add_argument('--auto_resume', type=str2bool, default=True)
     parser.add_argument('--save_ckpt', type=str2bool, default=True)
     parser.add_argument('--save_ckpt_freq', default=1, type=int)
@@ -193,6 +195,14 @@ def get_args_parser():
                         help="Use apex AMP (Automatic Mixed Precision) or not")
     return parser
 
+
+def print_multilabel_report(stats, header):
+    print(f"{header} micro-F1: {stats['micro_f1']:.3f}%")
+    print(f"{header} per-AU F1:")
+    print(f"{'AU':<8} {'F1':>8}")
+    for au_name, value in stats['per_au_f1'].items():
+        print(f"{au_name:<8} {value:>8.3f}")
+
 def main(args):
     utils.init_distributed_mode(args)
     print(args)
@@ -209,6 +219,8 @@ def main(args):
         raise ValueError('DISFA intensity mode needs a regression loss; use binary or strong mode here.')
 
     dataset_train, args.nb_classes = build_dataset(is_train=True, args=args)
+    if args.multilabel:
+        args.disfa_au_labels = [f'au{au}' for au in dataset_train.selected_aus]
     if args.disable_eval:
         args.dist_eval = False
         dataset_val = None
@@ -382,9 +394,12 @@ def main(args):
             criterion=criterion if args.multilabel else None,
             multilabel=args.multilabel,
             threshold=args.disfa_threshold,
+            au_labels=args.disfa_au_labels if args.multilabel else None,
+            log_micro_f1=args.disfa_log_micro_f1,
         )
         if args.multilabel:
             print(f"AU-F1 of the network on {len(dataset_val)} eval images: {test_stats['au_f1']:.5f}%")
+            print_multilabel_report(test_stats, 'Eval')
         else:
             print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         return
@@ -395,6 +410,7 @@ def main(args):
 
     primary_metric_name = 'au_f1' if args.multilabel else 'acc1'
     primary_metric_label = 'AU-F1' if args.multilabel else 'accuracy'
+    last_test_stats = None
 
     print("Start training for %d epochs" % args.epochs)
     start_time = time.time()
@@ -422,7 +438,10 @@ def main(args):
                 criterion=criterion if args.multilabel else None,
                 multilabel=args.multilabel,
                 threshold=args.disfa_threshold,
+                au_labels=args.disfa_au_labels if args.multilabel else None,
+                log_micro_f1=args.disfa_log_micro_f1,
             )
+            last_test_stats = test_stats
             print(f"{primary_metric_label} of the model on the {len(dataset_val)} test images: {test_stats[primary_metric_name]:.1f}%")
             if max_metric < test_stats[primary_metric_name]:
                 max_metric = test_stats[primary_metric_name]
@@ -436,6 +455,8 @@ def main(args):
                 if args.multilabel:
                     log_writer.update(test_au_acc=test_stats['au_acc'], head="perf", step=epoch)
                     log_writer.update(test_au_f1=test_stats['au_f1'], head="perf", step=epoch)
+                    if args.disfa_log_micro_f1:
+                        log_writer.update(test_micro_f1=test_stats['micro_f1'], head="perf", step=epoch)
                 else:
                     log_writer.update(test_acc1=test_stats['acc1'], head="perf", step=epoch)
                     log_writer.update(test_acc5=test_stats['acc5'], head="perf", step=epoch)
@@ -454,6 +475,8 @@ def main(args):
                     criterion=criterion if args.multilabel else None,
                     multilabel=args.multilabel,
                     threshold=args.disfa_threshold,
+                    au_labels=args.disfa_au_labels if args.multilabel else None,
+                    log_micro_f1=args.disfa_log_micro_f1,
                 )
                 print(f"{primary_metric_label} of the model EMA on {len(dataset_val)} test images: {test_stats_ema[primary_metric_name]:.1f}%")
                 if max_metric_ema < test_stats_ema[primary_metric_name]:
@@ -483,6 +506,8 @@ def main(args):
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
+    if args.multilabel and last_test_stats is not None:
+        print_multilabel_report(last_test_stats, 'Final')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('FCMAE fine-tuning', parents=[get_args_parser()])

@@ -136,7 +136,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
 @torch.no_grad()
-def evaluate(data_loader, model, device, use_amp=False, criterion=None, multilabel=False, threshold=0.5):
+def evaluate(
+    data_loader,
+    model,
+    device,
+    use_amp=False,
+    criterion=None,
+    multilabel=False,
+    threshold=0.5,
+    au_labels=None,
+    log_micro_f1=False,
+):
     if criterion is None:
         criterion = torch.nn.BCEWithLogitsLoss() if multilabel else torch.nn.CrossEntropyLoss()
 
@@ -202,11 +212,28 @@ def evaluate(data_loader, model, device, use_amp=False, criterion=None, multilab
     metric_logger.synchronize_between_processes()
     if multilabel:
         denom = (2 * true_positives + false_positives + false_negatives).clamp_min(1.0)
-        au_f1 = ((2 * true_positives) / denom).mean().item() * 100.0
-        print('* AU-Acc {au_acc.global_avg:.3f} AU-F1 {au_f1:.3f} loss {losses.global_avg:.3f}'
-              .format(au_acc=metric_logger.au_acc, au_f1=au_f1, losses=metric_logger.loss))
+        per_au_f1 = ((2 * true_positives) / denom) * 100.0
+        au_f1 = per_au_f1.mean().item()
+        micro_denom = (2 * true_positives.sum() + false_positives.sum() + false_negatives.sum()).clamp_min(1.0)
+        micro_f1 = ((2 * true_positives.sum()) / micro_denom).item() * 100.0
+        if au_labels is None:
+            au_labels = [f'au{i}' for i in range(len(per_au_f1))]
+        summary = '* AU-Acc {au_acc.global_avg:.3f} AU-F1 {au_f1:.3f}'
+        if log_micro_f1:
+            summary += ' micro-F1 {micro_f1:.3f}'
+        summary += ' loss {losses.global_avg:.3f}'
+        print(summary.format(
+            au_acc=metric_logger.au_acc,
+            au_f1=au_f1,
+            micro_f1=micro_f1,
+            losses=metric_logger.loss,
+        ))
         stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
         stats['au_f1'] = au_f1
+        stats['micro_f1'] = micro_f1
+        stats['per_au_f1'] = {
+            label: float(value) for label, value in zip(au_labels, per_au_f1.tolist())
+        }
         return stats
 
     print('* Acc@1 {top1.global_avg:.3f} Acc@5 {top5.global_avg:.3f} loss {losses.global_avg:.3f}'
