@@ -203,6 +203,25 @@ def print_multilabel_report(stats, header):
     for au_name, value in stats['per_au_f1'].items():
         print(f"{au_name:<8} {value:>8.3f}")
 
+
+def evaluate_best_disfa_checkpoint(args, model, model_without_ddp, data_loader_val, device, criterion):
+    best_ckpt_path = Path(args.output_dir) / 'checkpoint-best.pth'
+    if not best_ckpt_path.exists():
+        return None
+
+    print(f"Re-evaluating best DISFA checkpoint: {best_ckpt_path}")
+    checkpoint = torch.load(best_ckpt_path, map_location='cpu')
+    model_without_ddp.load_state_dict(checkpoint['model'])
+    return evaluate(
+        data_loader_val, model, device,
+        use_amp=args.use_amp,
+        criterion=criterion,
+        multilabel=True,
+        threshold=args.disfa_threshold,
+        au_labels=args.disfa_au_labels,
+        log_micro_f1=args.disfa_log_micro_f1,
+    )
+
 def main(args):
     utils.init_distributed_mode(args)
     print(args)
@@ -507,7 +526,13 @@ def main(args):
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
     print('Training time {}'.format(total_time_str))
     if args.multilabel and last_test_stats is not None:
-        print_multilabel_report(last_test_stats, 'Final')
+        final_test_stats = last_test_stats
+        if data_loader_val is not None and args.output_dir:
+            best_test_stats = evaluate_best_disfa_checkpoint(
+                args, model, model_without_ddp, data_loader_val, device, criterion)
+            if best_test_stats is not None:
+                final_test_stats = best_test_stats
+        print_multilabel_report(final_test_stats, 'Final')
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('FCMAE fine-tuning', parents=[get_args_parser()])
