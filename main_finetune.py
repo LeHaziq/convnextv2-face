@@ -423,9 +423,9 @@ def main(args):
             print(f"Accuracy of the network on {len(dataset_val)} test images: {test_stats['acc1']:.5f}%")
         return
 
-    max_metric = 0.0
+    max_metric = -1.0
     if args.model_ema and args.model_ema_eval:
-        max_metric_ema = 0.0
+        max_metric_ema = -1.0
 
     primary_metric_name = 'au_f1' if args.multilabel else 'acc1'
     primary_metric_label = 'AU-F1' if args.multilabel else 'accuracy'
