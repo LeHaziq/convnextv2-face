@@ -25,10 +25,20 @@ conda activate convnextv2-gpu
 Install PyTorch and core packages:
 
 ```bash
-conda install pytorch==1.8.0 torchvision==0.9.0 cudatoolkit=11.1 -c pytorch -c conda-forge -y
+conda install pytorch::pytorch=1.8.0=py3.8_cuda11.1_cudnn8.0.5_0 \
+  pytorch::torchvision=0.9.0=py38_cu111 \
+  conda-forge::cudatoolkit=11.1.1 -y
 conda install openblas-devel -c anaconda -y
 pip install timm==0.3.2 tensorboardX six submitit ninja
 ```
+
+Verify PyTorch sees CUDA before building `MinkowskiEngine`:
+
+```bash
+python -c "import torch; print(torch.__version__, torch.version.cuda, torch.cuda.is_available())"
+```
+
+Expected output should include CUDA `11.1` and `True`.
 
 Clone the repo and initialize submodules:
 
